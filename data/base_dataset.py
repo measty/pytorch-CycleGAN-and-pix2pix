@@ -78,7 +78,7 @@ def get_params(opt, size):
     return {'crop_pos': (x, y), 'flip': flip}
 
 
-def get_transform(opt, params=None, grayscale=False, method=transforms.InterpolationMode.BICUBIC, convert=True):
+def get_transform(opt, params=None, grayscale=False, method=transforms.InterpolationMode.BICUBIC, convert=True, A_or_B=None):
     transform_list = []
     if grayscale:
         transform_list.append(transforms.Grayscale(1))
@@ -102,6 +102,9 @@ def get_transform(opt, params=None, grayscale=False, method=transforms.Interpola
             transform_list.append(transforms.RandomHorizontalFlip())
         elif params['flip']:
             transform_list.append(transforms.Lambda(lambda img: __flip(img, params['flip'])))
+
+    if "jitter" in opt.preprocess and A_or_B == 'A':
+        transform_list.append(transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.15, hue=0.1))
 
     if convert:
         transform_list += [transforms.ToTensor()]
