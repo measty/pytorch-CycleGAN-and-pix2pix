@@ -36,17 +36,12 @@ from tiatoolbox.tools.patchextraction import SlidingWindowPatchExtractor, PatchE
 from tiatoolbox.wsicore import WSIReader
 from tqdm import tqdm
 import torchvision.transforms as transforms
-from util.util import tensor2im, tensors2im
+from util.util import tensor2im
 import torch
 import matplotlib.pyplot as plt
 from tiatoolbox.utils.image import imresize
 import torch.nn as nn
-from torch.utils.data import DataLoader
 from tiatoolbox.models.dataset import WSIPatchDataset
-
-class ToFloatTensor:
-    def __call__(self, tensor):
-        return tensor.permute(0,3,1,2) / 255.0
 
 try:
     import wandb
@@ -66,41 +61,19 @@ def construct_slide(slide_path, mask, patch_size=256, model=None, resolution=0, 
     mpp = wsi.info.mpp
     back_level = 245
     out_ch = 4 if stride is not None else 3
-    back_tile = np.ones((patch_size, patch_size, 3), dtype=np.uint8) * back_level
 
-    patch_dataset = WSIPatchDataset(
-        img_path=slide_path,
-        patch_input_shape=(patch_size, patch_size),
-        stride_shape=stride,
-        mask_path=mask, #'morphological',
+    patch_extractor = SlidingWindowPatchExtractor(
+        input_img=slide_path,
+        patch_size=(patch_size, patch_size),
+        stride=stride,
+        input_mask=mask, #'morphological',
         min_mask_ratio=0.1, # only discard patches with very low tissue content
+        within_bound=True,
         resolution=resolution,
         units=units,
-        auto_get_mask=False,
-        #preproc_func=lambda x: x.copy(),
-    )
-    patch_dataset.reader = slide_path
-    dataloader = DataLoader(
-        patch_dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=4,
-        drop_last=False,
-        pin_memory=True,
-    )
+    ) 
 
-    # patch_extractor = SlidingWindowPatchExtractor(
-    #     input_img=slide_path,
-    #     patch_size=(patch_size, patch_size),
-    #     stride=stride,
-    #     input_mask=mask, #'morphological',
-    #     min_mask_ratio=0.1, # only discard patches with very low tissue content
-    #     within_bound=True,
-    #     resolution=resolution,
-    #     units=units,
-    # ) 
-
-    #locs = patch_extractor.coordinate_list[:, :2]
+    locs = patch_extractor.coordinate_list[:, :2]
 
     cum_canvas = np.lib.format.open_memmap(
         tmp_path,
@@ -114,51 +87,35 @@ def construct_slide(slide_path, mask, patch_size=256, model=None, resolution=0, 
     else:
         cum_canvas[:] = back_level
 
-    #for i, tile in tqdm(enumerate(patch_extractor), total=len(patch_extractor)):
-    for batch in tqdm(dataloader, total=len(dataloader)):
-        ims = batch['image'].float()
-        locs = batch['coords']
+    for i, tile in tqdm(enumerate(patch_extractor), total=len(patch_extractor)):
         # if variance of tile vals less than threshold, skip
-        to_proc = np.ones(ims.shape[0], dtype=bool)
-        for i, tile in enumerate(ims):
-            #import pdb; pdb.set_trace()
-            if var_thresh and tile.var() < var_thresh:
-                to_proc[i] = False
-        to_keep = []
-        if to_proc.any():
-            recs = model(ims[to_proc])
-            for i, ind in zip(range(recs.shape[0]), np.arange(len(to_proc))[to_proc]):
-                if np.mean(recs[i]) < 70 or (var_thresh and np.var(recs[i]) < var_thresh):
-                    # if tile is very dark, or flat, will replace with background level
-                    to_proc[ind] = False
-                else:
-                    to_keep.append(i)
-
-        # add to canvas, using back_tile if not using processed tile
-        current_ind = 0
-        for i, loc in enumerate(locs):
-            x, y = loc[0], loc[1]
-            if to_proc[i]:
-                rec = recs[current_ind]
-                current_ind += 1
-            else:
-                rec = back_tile
-            if resolution > 0 and units == 'mpp':
-                x, y = int(x * resolution / mpp[0]), int(y * resolution / mpp[1])
-                out_size = (np.array(rec.shape[:2]) * resolution / mpp).astype(int) + 1
-                rec = imresize(rec, output_size=out_size)
-            if y+rec.shape[0] > canvas_shape[0] or x+rec.shape[1] > canvas_shape[1]:
-                print("patch out of bounds, cropping.")
-                rec = rec[:canvas_shape[0]-y, :canvas_shape[1]-x]
-                if rec.shape[0] == 0 or rec.shape[1] == 0:
-                    continue
-            if stride is None:
-                cum_canvas[y:y + rec.shape[0], x:x + rec.shape[1], :3] = rec
-            else:
-                # keep track of how many times each pixel has been written to
-                cum_canvas[y:y + rec.shape[0], x:x + rec.shape[1], 3] += 1
-                # add the new tile to the canvas
-                cum_canvas[y:y + rec.shape[0], x:x + rec.shape[1], :3] += rec
+        if var_thresh and np.var(tile) < var_thresh:
+            rec = tile
+        else:
+            rec = model(tile)
+            # if variance of processed tile vals less than threshold, skip
+            if np.var(rec) < var_thresh:
+                rec = tile
+        # if tile is very dark, replace with background level
+        if np.mean(rec) < 55:
+            rec = np.ones_like(rec) * back_level
+        x, y = locs[i]
+        if resolution > 0 and units == 'mpp':
+            x, y = int(x * resolution / mpp[0]), int(y * resolution / mpp[1])
+            out_size = (np.array(rec.shape[:2]) * resolution / mpp).astype(int) + 1
+            rec = imresize(rec, output_size=out_size)
+        if y+rec.shape[0] > canvas_shape[0] or x+rec.shape[1] > canvas_shape[1]:
+            print("patch out of bounds, cropping.")
+            rec = rec[:canvas_shape[0]-y, :canvas_shape[1]-x]
+            if rec.shape[0] == 0 or rec.shape[1] == 0:
+                continue
+        if stride is None:
+            cum_canvas[y:y + rec.shape[0], x:x + rec.shape[1], :3] = rec
+        else:
+            # keep track of how many times each pixel has been written to
+            cum_canvas[y:y + rec.shape[0], x:x + rec.shape[1], 3] += 1
+            # add the new tile to the canvas
+            cum_canvas[y:y + rec.shape[0], x:x + rec.shape[1], :3] += rec
     if stride is not None:
         # set pixels that havent been written to background level
         cum_canvas[cum_canvas[:,:,3] == 0, :3] = back_level
@@ -200,7 +157,7 @@ if __name__ == '__main__':
     model.setup(opt)               # regular setup: load and print networks; create schedulers
 
     transform_list = []
-    transform_list += [ToFloatTensor()]
+    transform_list += [transforms.ToTensor()]
     transform_list += [transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))]
     trans = transforms.Compose(transform_list)
 
@@ -215,25 +172,26 @@ if __name__ == '__main__':
             super().__init__()
             self.model = model
 
-        def forward(self, tiles):
-            tiles = trans(tiles)
+        def forward(self, tile):
+            tile = trans(tile.copy())
             if opt.direction == 'AtoB':
-                model.real_A = tiles.to('cuda')  # put image as input in mode A
+                model.real_A = torch.unsqueeze(tile, 0).to('cuda')  # put image as input in mode A
                 if opt.model == 'pix2pix':
                     model.forward()          # run inference
                     img_B = model.fake_B
                 elif opt.model == 'cycle_gan':
                     img_B = model.netG_A(model.real_A)  # only need fake B
-                return tensors2im(img_B)
-                
+                img_B = tensor2im(img_B)
+                return img_B
             elif opt.direction == 'BtoA':
-                model.real_B = tiles.to('cuda')
+                model.real_B = torch.unsqueeze(tile, 0).to('cuda')
                 if opt.model == 'pix2pix':
                     model.forward()
                     img_A = model.fake_A
                 elif opt.model == 'cycle_gan':
                     img_A = model.netG_B(model.real_B)
-                return tensors2im(img_A)
+                img_A = tensor2im(img_A)
+                return img_A
 
     slide_path = Path(opt.dataroot) 
     save_path = Path(opt.results_dir) 
@@ -278,5 +236,4 @@ if __name__ == '__main__':
             mask = mask_opt
         print(f"starting slide {slide}")
         construct_slide(slide, mask, model=ModelWrapper(model), resolution=resolution, units=units, stride=stride, save_path=save_path, back_heuristic=back_heuristic, var_thresh=var_thresh)
-        
-
+      
