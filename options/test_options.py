@@ -39,7 +39,8 @@ class SlideInferOptions(BaseOptions):
         parser.add_argument('--num_test', type=int, default=5000, help='how many test images to run')
         parser.add_argument('--masks_dir', type=str, default='otsu', help='path to the directory containing the masks, none, or "otsu".')
         parser.add_argument('--var_thresh', type=int, default=0, help='variance threshold for skipping patches.')
-        parser.add_argument('--resolution', type=int, default=0, help='resolution to use for slide inference in mpp. default 0 uses baseline.')
+        parser.add_argument('--model_resolution', type=float, default=0, help='resolution to use for slide inference in mpp. default 0 uses baseline.')
+        parser.add_argument('--save_resolution', type=float, default=0, help='resolution to construct slide at in mpp. default 0 uses baseline.')
         parser.add_argument('--stride', type=int, default=0, help='stride to use for slide inference in pixels. default 0 uses patch size.')
         parser.add_argument('--bkgrnd_heuristic', type=str, default='none', help='heuristic to use for background removal. none or morph.')
         # rewrite devalue values

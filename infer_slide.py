@@ -53,7 +53,7 @@ try:
 except ImportError:
     print('Warning: wandb package cannot be found. The option "--use_wandb" will result in error.')
 
-def construct_slide(slide_path, mask, patch_size=256, model=None, resolution=0, units='level', stride=None, save_path=None, back_heuristic='none', var_thresh=None, **kwargs):
+def construct_slide(slide_path, mask, patch_size=256, model=None, model_resolution=0, save_resolution=0, units='level', stride=None, save_path=None, back_heuristic='none', var_thresh=None, **kwargs):
     
     
     filename = Path(slide_path)
@@ -62,8 +62,8 @@ def construct_slide(slide_path, mask, patch_size=256, model=None, resolution=0, 
 
     tmp_path = save_path / (filename.stem + '_tmp_.npy')
     wsi = WSIReader.open(slide_path)
-    canvas_shape = wsi.info.slide_dimensions[::-1]
     mpp = wsi.info.mpp
+    canvas_shape = (wsi.info.slide_dimensions[::-1] * (mpp[::-1] / save_resolution)).astype(int)
     back_level = 245
     out_ch = 4 if stride is not None else 3
     back_tile = np.ones((patch_size, patch_size, 3), dtype=np.uint8) * back_level
@@ -74,17 +74,18 @@ def construct_slide(slide_path, mask, patch_size=256, model=None, resolution=0, 
         stride_shape=stride,
         mask_path=mask, #'morphological',
         min_mask_ratio=0.1, # only discard patches with very low tissue content
-        resolution=resolution,
+        resolution=model_resolution,
         units=units,
         auto_get_mask=False,
         #preproc_func=lambda x: x.copy(),
     )
-    patch_dataset.reader = slide_path
+    if loader_workers > 0:
+        patch_dataset.reader = slide_path
     dataloader = DataLoader(
         patch_dataset,
         batch_size=batch_size,
         shuffle=False,
-        num_workers=4,
+        num_workers=loader_workers,
         drop_last=False,
         pin_memory=True,
     )
@@ -143,15 +144,15 @@ def construct_slide(slide_path, mask, patch_size=256, model=None, resolution=0, 
                 current_ind += 1
             else:
                 rec = back_tile
-            if resolution > 0 and units == 'mpp':
-                x, y = int(x * resolution / mpp[0]), int(y * resolution / mpp[1])
-                out_size = (np.array(rec.shape[:2]) * resolution / mpp).astype(int) + 1
+            if model_resolution > 0 or save_resolution > 0 and units == 'mpp':
+                x, y = int(x * model_resolution / save_resolution), int(y * model_resolution / save_resolution)
+                out_size = (np.array(rec.shape[:2]) * model_resolution / save_resolution).astype(int) + 1
                 rec = imresize(rec, output_size=out_size)
             if y+rec.shape[0] > canvas_shape[0] or x+rec.shape[1] > canvas_shape[1]:
-                print("patch out of bounds, cropping.")
+                # patch overlaps edge of img, cropping.
                 rec = rec[:canvas_shape[0]-y, :canvas_shape[1]-x]
-                if rec.shape[0] == 0 or rec.shape[1] == 0:
-                    continue
+            if rec.shape[0] == 0 or rec.shape[1] == 0:
+                continue
             if stride is None:
                 cum_canvas[y:y + rec.shape[0], x:x + rec.shape[1], :3] = rec
             else:
@@ -164,8 +165,27 @@ def construct_slide(slide_path, mask, patch_size=256, model=None, resolution=0, 
         cum_canvas[cum_canvas[:,:,3] == 0, :3] = back_level
         # set pixel counts of background pixels to 1 to avoid divide by zero
         cum_canvas[cum_canvas[:,:,3] == 0, 3] = 1
-        # divide by the number of times each pixel was written to
-        cum_canvas[:,:,:3] = cum_canvas[:,:,:3] / cum_canvas[:,:,3:4]
+        # divide by the number of times each pixel was written to, patchwise to avoid memory issues
+        for i in tqdm(range(0, cum_canvas.shape[0], 4096)):
+            for j in range(0, cum_canvas.shape[1], 4096):
+                cum_canvas[
+                    i : min(i + 4096, cum_canvas.shape[0]),
+                    j : min(j + 4096, cum_canvas.shape[1]),
+                    :3,
+                ] = (
+                    cum_canvas[
+                        i : min(i + 4096, cum_canvas.shape[0]),
+                        j : min(j + 4096, cum_canvas.shape[1]),
+                        :3,
+                    ]
+                    / cum_canvas[
+                        i : min(i + 4096, cum_canvas.shape[0]),
+                        j : min(j + 4096, cum_canvas.shape[1]),
+                        3:4,
+                    ]
+                ).astype(
+                    np.uint8
+                )
         cum_canvas = cum_canvas[:,:,:3]
         
     # make a vips image and save it as a pyramidal tiff
@@ -180,7 +200,11 @@ def construct_slide(slide_path, mask, patch_size=256, model=None, resolution=0, 
     )
     # set resolution metadata - tiffsave expects res in pixels per mm regardless of resunit
     save_path = save_path / (filename.stem + '_proc.tiff')
-    vips_img.tiffsave(save_path, tile=True, pyramid=True, compression="jpeg", Q=85, bigtiff=True, xres=1000/mpp[0], yres=1000/mpp[1], resunit="cm", tile_width=512, tile_height=512)
+    if save_resolution == 0:
+        save_resolution = mpp
+    else:
+        save_resolution = np.array([save_resolution, save_resolution])
+    vips_img.tiffsave(save_path, tile=True, pyramid=True, compression="jpeg", Q=85, bigtiff=True, xres=1000/save_resolution[0], yres=1000/save_resolution[1], resunit="cm", tile_width=512, tile_height=512)
     print(f"saved slide {filename.stem} to {save_path}")
     # close memmap and clean up
     cum_canvas._mmap.close()
@@ -235,6 +259,7 @@ if __name__ == '__main__':
                     img_A = model.netG_B(model.real_B)
                 return tensors2im(img_A)
 
+    loader_workers = 0
     slide_path = Path(opt.dataroot) 
     save_path = Path(opt.results_dir) 
     batch_size = opt.batch_size
@@ -243,9 +268,10 @@ if __name__ == '__main__':
         stride = None
     else:
         stride = (stride, stride)
-    resolution = opt.resolution
+    model_resolution = opt.model_resolution
+    save_resolution = opt.save_resolution
     units = 'level'
-    if resolution > 0:
+    if model_resolution > 0:
         units = 'mpp'
     mask_opt = opt.masks_dir
     if mask_opt not in ["otsu", "morphological", "none"]:
@@ -277,6 +303,6 @@ if __name__ == '__main__':
         else:
             mask = mask_opt
         print(f"starting slide {slide}")
-        construct_slide(slide, mask, model=ModelWrapper(model), resolution=resolution, units=units, stride=stride, save_path=save_path, back_heuristic=back_heuristic, var_thresh=var_thresh)
+        construct_slide(slide, mask, model=ModelWrapper(model), model_resolution=model_resolution, save_resolution=save_resolution, units=units, stride=stride, save_path=save_path, back_heuristic=back_heuristic, var_thresh=var_thresh)
         
 
