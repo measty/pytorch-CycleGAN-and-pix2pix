@@ -151,7 +151,8 @@ def construct_slide(slide_path, mask, patch_size=256, model=None, model_resoluti
             if y+rec.shape[0] > canvas_shape[0] or x+rec.shape[1] > canvas_shape[1]:
                 # patch overlaps edge of img, cropping.
                 rec = rec[:canvas_shape[0]-y, :canvas_shape[1]-x]
-            if rec.shape[0] == 0 or rec.shape[1] == 0:
+            if rec.shape[0] == 0 or rec.shape[1] == 0 or y >= canvas_shape[0] or x >= canvas_shape[1]:
+                # patch is completely outside of img, skipping. shouldnt happen but tiatoolbox patchextractor has bug
                 continue
             if stride is None:
                 cum_canvas[y:y + rec.shape[0], x:x + rec.shape[1], :3] = rec
