@@ -221,8 +221,12 @@ if __name__ == '__main__':
     opt.serial_batches = True  # disable data shuffling; comment this line if results on randomly chosen images are needed.
     opt.no_flip = True    # no flip; comment this line if results on flipped images are needed.
     opt.display_id = -1   # no visdom display; the test code saves the results to a HTML file.
-    model = create_model(opt)      # create a model given opt.model and other options
-    model.setup(opt)               # regular setup: load and print networks; create schedulers
+    if opt.model == 'none':
+        # hack to use it as slide converter, we just pass the tiles through
+        model = None
+    else:
+        model = create_model(opt)      # create a model given opt.model and other options
+        model.setup(opt)               # regular setup: load and print networks; create schedulers
 
     transform_list = []
     transform_list += [ToFloatTensor()]
@@ -241,6 +245,8 @@ if __name__ == '__main__':
             self.model = model
 
         def forward(self, tiles):
+            if model is None:
+                return tiles
             tiles = trans(tiles)
             if opt.direction == 'AtoB':
                 model.real_A = tiles.to('cuda')  # put image as input in mode A
