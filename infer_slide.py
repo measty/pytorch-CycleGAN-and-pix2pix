@@ -62,8 +62,12 @@ def construct_slide(slide_path, mask, patch_size=256, model=None, model_resoluti
 
     tmp_path = save_path / (filename.stem + '_tmp_.npy')
     wsi = WSIReader.open(slide_path)
-    mpp = wsi.info.mpp
-    canvas_shape = (wsi.info.slide_dimensions[::-1] * (mpp[::-1] / save_resolution)).astype(int)
+    mpp = wsi.info.mpp or np.array([1.0, 1.0])
+    if save_resolution == 0:
+        canvas_shape = wsi.info.slide_dimensions[::-1]
+    else:
+        canvas_shape = (wsi.info.slide_dimensions[::-1] * (mpp[::-1] / save_resolution)).astype(int)
+    #import pdb; pdb.set_trace()
     back_level = 245
     out_ch = 4 if stride is not None else 3
     back_tile = np.ones((patch_size, patch_size, 3), dtype=np.uint8) * back_level
@@ -71,7 +75,7 @@ def construct_slide(slide_path, mask, patch_size=256, model=None, model_resoluti
     patch_dataset = WSIPatchDataset(
         img_path=slide_path,
         patch_input_shape=(patch_size, patch_size),
-        stride_shape=stride,
+        stride_shape=stride or (patch_size, patch_size),
         mask_path=mask, #'morphological',
         min_mask_ratio=0.1, # only discard patches with very low tissue content
         resolution=model_resolution,
@@ -199,13 +203,41 @@ def construct_slide(slide_path, mask, patch_size=256, model=None, model_resoluti
         3,
         "uchar"
     )
+
+    # bioformats compatibility stuff
+    image_height = vips_img.height
+    image_bands = vips_img.bands
+    #vips_img = vips.Image.arrayjoin(vips_img.bandsplit(), across=1)
+    vips_img.set_type(vips.GValue.gint_type, "page-height", image_height)
+    vips_img.set_type(vips.GValue.gstr_type, "image-description",
+    f"""<?xml version="1.0" encoding="UTF-8"?>
+    <OME xmlns="http://www.openmicroscopy.org/Schemas/OME/2016-06"
+        xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+        xsi:schemaLocation="http://www.openmicroscopy.org/Schemas/OME/2016-06 http://www.openmicroscopy.org/Schemas/OME/2016-06/ome.xsd">
+        <Image ID="Image:0">
+            <!-- Minimum required fields about image dimensions -->
+            <Pixels DimensionOrder="XYCZT"
+                    ID="Pixels:0"
+                    SizeC="{image_bands}"
+                    SizeT="1"
+                    SizeX="{vips_img.width}"
+                    SizeY="{image_height}"
+                    SizeZ="1"
+                    Type="uint8">
+                    <Channel ID="Channel:0:0" SamplesPerPixel="3">
+                        <LightPath/>
+                    </Channel>
+            </Pixels>
+        </Image>
+    </OME>""")
+
     # set resolution metadata - tiffsave expects res in pixels per mm regardless of resunit
     save_path = save_path / (filename.stem + '_proc.tiff')
     if save_resolution == 0:
         save_resolution = mpp
     else:
         save_resolution = np.array([save_resolution, save_resolution])
-    vips_img.tiffsave(save_path, tile=True, pyramid=True, compression="jpeg", Q=85, bigtiff=True, xres=1000/save_resolution[0], yres=1000/save_resolution[1], resunit="cm", tile_width=512, tile_height=512)
+    vips_img.tiffsave(save_path, tile=True, pyramid=True, compression="jpeg", Q=85, bigtiff=True, xres=1000/save_resolution[0], yres=1000/save_resolution[1], resunit="cm", tile_width=512, tile_height=512) #, subifd=True)
     print(f"saved slide {filename.stem} to {save_path}")
     # close memmap and clean up
     cum_canvas._mmap.close()
@@ -221,12 +253,17 @@ if __name__ == '__main__':
     opt.serial_batches = True  # disable data shuffling; comment this line if results on randomly chosen images are needed.
     opt.no_flip = True    # no flip; comment this line if results on flipped images are needed.
     opt.display_id = -1   # no visdom display; the test code saves the results to a HTML file.
-    if opt.model == 'none':
+    if opt.gpu_ids == '-1' or len(opt.gpu_ids) == 0 or opt.name == 'none':
+        device = 'cpu'
+    else:
+        device = 'cuda'
+    if opt.name == 'none':
         # hack to use it as slide converter, we just pass the tiles through
         model = None
     else:
         model = create_model(opt)      # create a model given opt.model and other options
         model.setup(opt)               # regular setup: load and print networks; create schedulers
+        model.eval()
 
     transform_list = []
     transform_list += [ToFloatTensor()]
@@ -238,18 +275,18 @@ if __name__ == '__main__':
         wandb_run = wandb.init(project=opt.wandb_project_name, name=opt.name, config=opt) if not wandb.run else wandb.run
         wandb_run._label(repo='CycleGAN-and-pix2pix')
 
-    model.eval()
+    
     class ModelWrapper(nn.Module):
         def __init__(self, model):
             super().__init__()
             self.model = model
 
         def forward(self, tiles):
-            if model is None:
-                return tiles
+            if self.model is None:
+                return tiles.numpy()
             tiles = trans(tiles)
             if opt.direction == 'AtoB':
-                model.real_A = tiles.to('cuda')  # put image as input in mode A
+                model.real_A = tiles.to(device)  # put image as input in mode A
                 if opt.model == 'pix2pix':
                     model.forward()          # run inference
                     img_B = model.fake_B
@@ -258,7 +295,7 @@ if __name__ == '__main__':
                 return tensors2im(img_B)
                 
             elif opt.direction == 'BtoA':
-                model.real_B = tiles.to('cuda')
+                model.real_B = tiles.to(device)
                 if opt.model == 'pix2pix':
                     model.forward()
                     img_A = model.fake_A
