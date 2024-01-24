@@ -3,11 +3,183 @@ import torch.nn as nn
 from torch.nn import init
 import functools
 from torch.optim import lr_scheduler
+import torchvision.transforms as transforms
 
 
 ###############################################################################
 # Helper Functions
 ###############################################################################
+def rgb2l(x):
+    """Calculates l channel from rgb image."""
+    # Define constants for RGB to XYZ conversion (sRGB color space with D65 illuminant)
+    rgb_to_xyz_matrix = torch.tensor([[0.4124564, 0.3575761, 0.1804375],
+                                    [0.2126729, 0.7151522, 0.0721750],
+                                    [0.0193339, 0.1191920, 0.9503041]], device=x.device)
+
+    # Reference white point for D65 illuminant in XYZ space
+    white_point = torch.tensor([0.95047, 1.00000, 1.08883], device=x.device)
+
+    # Apply gamma correction to the input RGB values
+    x = torch.where(x <= 0.04045, x / 12.92, ((x + 0.055) / 1.055) ** 2.4)
+
+    # Convert RGB to XYZ
+    xyz_tensor = torch.einsum("ijkl,jm->imkl", x, rgb_to_xyz_matrix)
+    #xyz_tensor = torch.einsum('ij,njhw->nihw', rgb_to_xyz_matrix, x)
+
+    # Normalize XYZ values by the reference white point
+    xyz_tensor = xyz_tensor / white_point[None, :, None, None]
+
+    # Apply the LAB transformation
+    epsilon = 6 / 29
+    kappa = (29 / 6) ** 3
+    f = torch.where(xyz_tensor > epsilon ** 3, torch.pow(xyz_tensor, 1/3), (kappa * xyz_tensor + 16) / 116)
+
+    # Calculate the L* channel
+    l = 116 * f[:, 1, :, :] - 16
+    # rescale between 0 and 1
+    return (l + 128.0) / 255.0
+
+def rgb2lab_torch(rgb, illuminant='D65'):
+    """Convert RGB to CIELAB using torch tensors. follows scikit-image implementation.
+
+    Args:
+        rgb (torch.Tensor): RGB float pixel list in range (0,1).
+        illuminant (str): The name of the illuminant.
+
+    Returns:
+        torch.Tensor: CIELAB image.
+
+    """
+    xyz_from_rgb = torch.tensor([[0.412453, 0.357580, 0.180423],
+                         [0.212671, 0.715160, 0.072169],
+                         [0.019334, 0.119193, 0.950227]]).to(rgb.device)
+    # convert rgb to xyz
+    mask = rgb > 0.04045
+    # to linear rgb
+    rgb[mask] = torch.pow((rgb[mask] + 0.055) / 1.055, 2.4)
+    rgb[~mask] /= 12.92
+    xyz = rgb @ xyz_from_rgb.T
+    # convert xyz to lab
+    xyz_ref_white = torch.tensor([0.950456, 1.0, 1.088754]).to(rgb.device)
+
+    # scale by CIE XYZ tristimulus values of the reference white point
+    xyz = xyz / xyz_ref_white
+
+    # Nonlinear distortion and linear transformation
+    mask = xyz > 0.008856
+    xyz[mask] = torch.pow(xyz[mask], 1. / 3.)
+    xyz[~mask] = 7.787 * xyz[~mask] + 16. / 116.
+
+    x, y, z = xyz[..., 0], xyz[..., 1], xyz[..., 2]
+
+    # Vector scaling
+    L = (116. * y) - 16.
+    a = 500.0 * (x - y)
+    b = 200.0 * (y - z)
+
+    lab = torch.concatenate([torch.unsqueeze(x, 1) for x in [L, a, b]], axis=-1)
+    # rescale between 0 and 1
+    lab = (lab + 128.0) / 255.0
+    return lab
+
+class LumMask(nn.Module):
+    """A wrapper for a network which identifies background pixels via
+    luminance thresholding. The network is applied, and then the pixels
+    comprising the background are reset to the values of the input image.
+    This ensures the network does not learn the background as a 'stain'.
+    """
+    def __init__(self, net, lum_thresh=0.9):
+        super(LumMask, self).__init__()
+        self.net = net
+        self.lum_thresh = lum_thresh
+
+    def forward(self, x):
+        # get luminance
+        lum = torch.squeeze(rgb2l(x))
+        # get mask
+        mask = lum > self.lum_thresh
+        # apply network
+        z = self.net(x)
+        # set background pixels to input image
+        z = z.clone()
+        z[:,:,mask] = x[:,:,mask]
+        return z
+
+class Reshape(nn.Module):
+    def __init__(self, shape):
+        super(Reshape, self).__init__()
+        self.shape = shape
+
+    def forward(self, x):
+        return x.view(self.shape)
+
+class ZeroStain(nn.Module):
+    """Module which supresses a specific stain channel by multiplying
+    it by a small factor."""
+    def __init__(self, channel, copy=True, factor=0.05):
+        super(ZeroStain, self).__init__()
+        self.channel = channel
+        self.copy = copy
+        self.factor = factor # make a parameter?
+
+    def forward(self, x):
+        if self.channel is None:
+            return x
+        if self.copy:
+            x = x.clone()
+            x[:, self.channel, :, :] *= self.factor
+            return x
+        else:
+            x[:, self.channel, :, :] *= self.factor
+            return x
+
+class RGB2OD(nn.Module):
+    def __init__(self):
+        super(RGB2OD, self).__init__()
+
+    def forward(self, x):
+        x = torch.clamp(x, 1E-6)
+        log_adjust = torch.log(torch.tensor(1E-6))
+        return torch.log(x) / log_adjust
+
+class OD2RGB(nn.Module):
+    def __init__(self):
+        super(OD2RGB, self).__init__()
+
+    def forward(self, x):
+        x = torch.clamp(x, 1e-6)
+        return torch.exp(-1 * x)
+
+class StainSeparate(nn.Module):
+    def __init__(self, stain_matrix):
+        super(StainSeparate, self).__init__()
+        self.stain_matrix = stain_matrix
+
+    def forward(self, x):
+        x = torch.einsum("ijkl,jm->imkl", x, torch.inverse(self.stain_matrix))
+        return x
+
+class StainCombine(nn.Module):
+    def __init__(self, stain_matrix):
+        super(StainCombine, self).__init__()
+        self.stain_matrix = stain_matrix
+
+    def forward(self, x):
+        log_adjust = -torch.log(torch.tensor(1E-6))
+        # multiply with inverse of stain matrix
+        x = torch.einsum("ijkl,jm->imkl", x * log_adjust, self.stain_matrix)
+        return x
+    
+class UndoNormalize(nn.Module):
+    def __init__(self, mean=0.5, std=0.5):
+        super(UndoNormalize, self).__init__()
+        self.mean = mean
+        self.std = std
+
+    def forward(self, x):
+        x = x * self.std + self.mean
+        return x
+
 
 
 class Identity(nn.Module):
@@ -117,7 +289,7 @@ def init_net(net, init_type='normal', init_gain=0.02, gpu_ids=[]):
     return net
 
 
-def define_G(input_nc, output_nc, ngf, netG, norm='batch', use_dropout=False, init_type='normal', init_gain=0.02, gpu_ids=[]):
+def define_G(input_nc, output_nc, ngf, netG, norm='batch', use_dropout=False, init_type='normal', init_gain=0.02, gpu_ids=[], stain_task: str = None, stain_matrix=None, lum_pass=False):
     """Create a generator
 
     Parameters:
@@ -157,6 +329,30 @@ def define_G(input_nc, output_nc, ngf, netG, norm='batch', use_dropout=False, in
         net = UnetGenerator(input_nc, output_nc, 8, ngf, norm_layer=norm_layer, use_dropout=use_dropout)
     else:
         raise NotImplementedError('Generator model name [%s] is not recognized' % netG)
+    
+    # if its a generator for a restaining task, we will wrap the generator in a stain separation
+    # and recombination module
+    if stain_task is not None:
+        # check which channel to zero out
+        stain_task = {"HE": 2, "HD": 1, "HED": None}[stain_task.upper()]
+        net = nn.Sequential(
+            RGB2OD(),
+            StainSeparate(stain_matrix),
+            nn.ReLU(),
+            transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
+            net,
+            UndoNormalize(),
+        #), "stain_applier": nn.Sequential(
+            ZeroStain(stain_task),
+            StainCombine(stain_matrix),
+            OD2RGB(),
+            nn.ReLU(),
+        )
+        if lum_pass:
+            net = LumMask(net)
+        # }
+        #return {"stain_learner": init_net(net["stain_learner"], init_type, init_gain, gpu_ids), "stain_applier": init_net(net["stain_applier"], init_type, init_gain, gpu_ids)}
+    
     return init_net(net, init_type, init_gain, gpu_ids)
 
 

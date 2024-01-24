@@ -1,11 +1,13 @@
 import torch
 import itertools
+import numpy as np
 from util.image_pool import ImagePool
 from .base_model import BaseModel
 from . import networks
 
 
-class CycleGANModel(BaseModel):
+
+class StainCycleModel(BaseModel):
     """
     This class implements the CycleGAN model, for learning image-to-image translation without paired data.
 
@@ -36,12 +38,14 @@ class CycleGANModel(BaseModel):
         Identity loss (optional): lambda_identity * (||G_A(B) - B|| * lambda_B + ||G_B(A) - A|| * lambda_A) (Sec 5.2 "Photo generation from paintings" in the paper)
         Dropout is not used in the original CycleGAN paper.
         """
+        parser.add_argument('--stain_task', type=str, help='specify the stain translation task (HE_HD or HD_HE)')
+        parser.add_argument('--lum_mask', action='store_true', help='if specified, use luminance mask to pass background unchanged through the network')
         parser.set_defaults(no_dropout=True)  # default CycleGAN did not use dropout
         if is_train:
             parser.add_argument('--lambda_A', type=float, default=10.0, help='weight for cycle loss (A -> B -> A)')
             parser.add_argument('--lambda_B', type=float, default=10.0, help='weight for cycle loss (B -> A -> B)')
             parser.add_argument('--lambda_identity', type=float, default=0.5, help='use identity mapping. Setting lambda_identity other than 0 has an effect of scaling the weight of the identity mapping loss. For example, if the weight of the identity loss should be 10 times smaller than the weight of the reconstruction loss, please set lambda_identity = 0.1')
-
+            parser.add_argument('--lambda_SM', type=float, default=0.5, help='weight for stain matrix loss')
         return parser
 
     def __init__(self, opt):
@@ -70,10 +74,18 @@ class CycleGANModel(BaseModel):
         # define networks (both Generators and discriminators)
         # The naming is different from those used in the paper.
         # Code (vs. paper): G_A (G), G_B (F), D_A (D_Y), D_B (D_X)
+
+        # default stain matrix
+        #stain_matrix = [[0.458,0.814,0.356],[0.259,0.866,0.428],[0.269,0.568,0.778]]
+        self.orig_stain_matrix = torch.tensor([[0.65, 0.70, 0.29],
+                    [0.07, 0.99, 0.11],
+                    [0.27, 0.57, 0.78]])
+        self.stain_matrix = torch.nn.Parameter(torch.empty_like(self.orig_stain_matrix).copy_(self.orig_stain_matrix))
+
         self.netG_A = networks.define_G(opt.input_nc, opt.output_nc, opt.ngf, opt.netG, opt.norm,
-                                        not opt.no_dropout, opt.init_type, opt.init_gain, self.gpu_ids, opt.stain_task)
+                                        not opt.no_dropout, opt.init_type, opt.init_gain, self.gpu_ids, opt.stain_task.split("_")[1], self.stain_matrix, opt.lum_mask)
         self.netG_B = networks.define_G(opt.output_nc, opt.input_nc, opt.ngf, opt.netG, opt.norm,
-                                        not opt.no_dropout, opt.init_type, opt.init_gain, self.gpu_ids, opt.stain_task)
+                                        not opt.no_dropout, opt.init_type, opt.init_gain, self.gpu_ids, opt.stain_task.split("_")[0], self.stain_matrix, opt.lum_mask)
 
         if self.isTrain:  # define discriminators
             self.netD_A = networks.define_D(opt.output_nc, opt.ndf, opt.netD,
@@ -95,7 +107,7 @@ class CycleGANModel(BaseModel):
             self.optimizer_D = torch.optim.Adam(itertools.chain(self.netD_A.parameters(), self.netD_B.parameters()), lr=opt.lr, betas=(opt.beta1, 0.999))
             self.optimizers.append(self.optimizer_G)
             self.optimizers.append(self.optimizer_D)
-
+    
     def set_input(self, input):
         """Unpack input data from the dataloader and perform necessary pre-processing steps.
 
@@ -153,6 +165,7 @@ class CycleGANModel(BaseModel):
         lambda_idt = self.opt.lambda_identity
         lambda_A = self.opt.lambda_A
         lambda_B = self.opt.lambda_B
+        lambda_SM = self.opt.lambda_SM
         # Identity loss
         if lambda_idt > 0:
             # G_A should be identity if real_B is fed: ||G_A(B) - B||
@@ -173,8 +186,11 @@ class CycleGANModel(BaseModel):
         self.loss_cycle_A = self.criterionCycle(self.rec_A, self.real_A) * lambda_A
         # Backward cycle loss || G_A(G_B(B)) - B||
         self.loss_cycle_B = self.criterionCycle(self.rec_B, self.real_B) * lambda_B
+        # stain matrix loss || stain_matrix - orig_stain_matrix ||
+        self.loss_stain_matrix = torch.nn.MSELoss()(self.stain_matrix, self.orig_stain_matrix.to(self.device)) * lambda_SM
+        # do we need a loss that ensures d does not become less when removing one of the other stains from hed?
         # combined loss and calculate gradients
-        self.loss_G = self.loss_G_A + self.loss_G_B + self.loss_cycle_A + self.loss_cycle_B + self.loss_idt_A + self.loss_idt_B
+        self.loss_G = self.loss_G_A + self.loss_G_B + self.loss_cycle_A + self.loss_cycle_B + self.loss_idt_A + self.loss_idt_B + self.loss_stain_matrix
         self.loss_G.backward()
 
     def optimize_parameters(self):

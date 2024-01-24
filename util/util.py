@@ -6,7 +6,7 @@ from PIL import Image
 import os
 
 
-def tensor2im(input_image, imtype=np.uint8):
+def tensor2im(input_image, imtype=np.uint8, undo_norm=False):
     """"Converts a Tensor array into a numpy image array.
 
     Parameters:
@@ -21,13 +21,16 @@ def tensor2im(input_image, imtype=np.uint8):
         image_numpy = image_tensor[0].cpu().float().numpy()  # convert it into a numpy array
         if image_numpy.shape[0] == 1:  # grayscale to RGB
             image_numpy = np.tile(image_numpy, (3, 1, 1))
-        image_numpy = (np.transpose(image_numpy, (1, 2, 0)) + 1) / 2.0 * 255.0  # post-processing: tranpose and scaling
+        if undo_norm:
+            image_numpy = (np.transpose(image_numpy, (1, 2, 0)) + 1) / 2.0 * 255.0  # post-processing: tranpose and scaling
+        else:
+            image_numpy = np.transpose(image_numpy, (1, 2, 0)) * 255.0  # post-processing: tranpose
     else:  # if it is a numpy array, do nothing
         image_numpy = input_image
     return image_numpy.astype(imtype)
 
 
-def tensors2im(input_image, imtype=np.uint8):
+def tensors2im(input_image, imtype=np.uint8, undo_norm=True):
     """"Converts a Tensor array containing a batch of images into a numpy image array.
 
     Parameters:
@@ -42,7 +45,10 @@ def tensors2im(input_image, imtype=np.uint8):
         image_numpy = image_tensor.cpu().float().numpy()  # convert it into a numpy array
         if image_numpy.shape[1] == 1:  # grayscale to RGB
             image_numpy = np.tile(image_numpy, (1, 3, 1, 1))
-        image_numpy = (np.transpose(image_numpy, (0, 2, 3, 1)) + 1) / 2.0 * 255.0  # post-processing: tranpose and scaling
+        if undo_norm:
+            image_numpy = (np.transpose(image_numpy, (0, 2, 3, 1)) + 1) / 2.0 * 255.0  # post-processing: tranpose and scaling
+        else:
+            image_numpy = np.transpose(image_numpy, (0, 2, 3, 1)) * 255.0
     else:  # if it is a numpy array, do nothing
         image_numpy = input_image
     return image_numpy.astype(imtype)

@@ -43,6 +43,7 @@ from tiatoolbox.utils.image import imresize
 import torch.nn as nn
 from torch.utils.data import DataLoader
 from tiatoolbox.models.dataset import WSIPatchDataset
+import cv2
 
 class ToFloatTensor:
     def __call__(self, tensor):
@@ -53,6 +54,43 @@ try:
 except ImportError:
     print('Warning: wandb package cannot be found. The option "--use_wandb" will result in error.')
 
+def border_mask(slide_dimensions):
+    # Step 1: Create a mask of the same aspect ratio as the slide but 5x smaller
+    smaller_dims = (slide_dimensions[0] // 5, slide_dimensions[1] // 5)
+    mask = np.zeros(smaller_dims, dtype=np.uint8)
+
+    # Step 2: Calculate the dimensions of the inner rectangle (which will be white)
+    border_thickness = int(slide_dimensions[1] / 40)
+    inner_rectangle_top_left = (border_thickness, border_thickness)
+    inner_rectangle_bottom_right = (smaller_dims[1] - border_thickness, smaller_dims[0] - border_thickness)
+
+    # Draw the inner rectangle on the mask
+    cv2.rectangle(mask, inner_rectangle_top_left, inner_rectangle_bottom_right, 255, -1)
+    return mask
+
+def is_valid_patch(image):
+    # Ensure the image has three channels
+    if image.ndim != 3 or image.shape[2] != 3:
+        raise ValueError("Input image must have shape HxWx3.")
+    
+    # Convert the image to grayscale
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    # Step 1: Compute the Laplacian of the image and then return the focus measure,
+    # which is simply the variance of the Laplacian
+    fm = cv2.Laplacian(gray, cv2.CV_32F).var()
+    if fm < 65:  # This threshold can be adjusted based on your specific needs
+        return False  # Blurry
+    
+    # Step 2: Analyze the histogram
+    hist = cv2.calcHist([gray], [0], None, [256], [0, 256])
+    peak = np.max(hist)
+    if peak > 0.5 * gray.size:
+        brightness = np.sum(gray) / float(gray.size)
+        if brightness > 228 or brightness < 50:
+            return False  # Mostly bright or mostly dark indicating non-tissue or border
+    
+    return True
+
 def construct_slide(slide_path, mask, patch_size=256, model=None, model_resolution=0, save_resolution=0, units='level', stride=None, save_path=None, back_heuristic='none', var_thresh=None, **kwargs):
     
     
@@ -62,7 +100,7 @@ def construct_slide(slide_path, mask, patch_size=256, model=None, model_resoluti
 
     tmp_path = save_path / (filename.stem + '_tmp_.npy')
     wsi = WSIReader.open(slide_path)
-    mpp = wsi.info.mpp or np.array([1.0, 1.0])
+    mpp = wsi.info.mpp if wsi.info.mpp is not None else np.array([1.0, 1.0])
     if save_resolution == 0:
         canvas_shape = wsi.info.slide_dimensions[::-1]
     else:
@@ -71,7 +109,11 @@ def construct_slide(slide_path, mask, patch_size=256, model=None, model_resoluti
     back_level = 245
     out_ch = 4 if stride is not None else 3
     back_tile = np.ones((patch_size, patch_size, 3), dtype=np.uint8) * back_level
-
+    if mask == 'otsu':
+        get_mask = True
+        mask = None
+    else:
+        get_mask = False
     patch_dataset = WSIPatchDataset(
         img_path=slide_path,
         patch_input_shape=(patch_size, patch_size),
@@ -80,7 +122,7 @@ def construct_slide(slide_path, mask, patch_size=256, model=None, model_resoluti
         min_mask_ratio=0.1, # only discard patches with very low tissue content
         resolution=model_resolution,
         units=units,
-        auto_get_mask=False,
+        auto_get_mask=get_mask,
         #preproc_func=lambda x: x.copy(),
     )
     if loader_workers > 0:
@@ -127,7 +169,7 @@ def construct_slide(slide_path, mask, patch_size=256, model=None, model_resoluti
         to_proc = np.ones(ims.shape[0], dtype=bool)
         for i, tile in enumerate(ims):
             #import pdb; pdb.set_trace()
-            if var_thresh and tile.var() < var_thresh:
+            if (var_thresh and tile.var() < var_thresh) or not is_valid_patch(tile.numpy()):
                 to_proc[i] = False
         to_keep = []
         if to_proc.any():
@@ -170,39 +212,56 @@ def construct_slide(slide_path, mask, patch_size=256, model=None, model_resoluti
         cum_canvas[cum_canvas[:,:,3] == 0, :3] = back_level
         # set pixel counts of background pixels to 1 to avoid divide by zero
         cum_canvas[cum_canvas[:,:,3] == 0, 3] = 1
-        # divide by the number of times each pixel was written to, patchwise to avoid memory issues
-        for i in tqdm(range(0, cum_canvas.shape[0], 4096)):
-            for j in range(0, cum_canvas.shape[1], 4096):
-                cum_canvas[
-                    i : min(i + 4096, cum_canvas.shape[0]),
-                    j : min(j + 4096, cum_canvas.shape[1]),
-                    :3,
-                ] = (
-                    cum_canvas[
-                        i : min(i + 4096, cum_canvas.shape[0]),
-                        j : min(j + 4096, cum_canvas.shape[1]),
-                        :3,
-                    ]
-                    / cum_canvas[
-                        i : min(i + 4096, cum_canvas.shape[0]),
-                        j : min(j + 4096, cum_canvas.shape[1]),
-                        3:4,
-                    ]
-                ).astype(
-                    np.uint8
-                )
-        cum_canvas = cum_canvas[:,:,:3]
+        
+        def process_in_tiles():
+            # divide by the number of times each pixel was written to, patchwise to avoid memory issues
+            for i in tqdm(range(0, cum_canvas.shape[0], 4096)):
+                for j in range(0, cum_canvas.shape[1], 4096):
+                    # cum_canvas[
+                    #     i : min(i + 4096, cum_canvas.shape[0]),
+                    #     j : min(j + 4096, cum_canvas.shape[1]),
+                    #     :3,
+                    # ] = 
+                    yield (
+                        cum_canvas[
+                            i : min(i + 4096, cum_canvas.shape[0]),
+                            j : min(j + 4096, cum_canvas.shape[1]),
+                            :3,
+                        ]
+                        / cum_canvas[
+                            i : min(i + 4096, cum_canvas.shape[0]),
+                            j : min(j + 4096, cum_canvas.shape[1]),
+                            3:4,
+                        ]
+                    ).astype(
+                        np.uint8
+                    ), i, j
+            #cum_canvas = cum_canvas[:,:,:3]
         
     # make a vips image and save it as a pyramidal tiff
     #height, width, bands = cum_canvas.shape
     #linear = cum_canvas.reshape(width * height * bands)
-    vips_img = vips.Image.new_from_memory(
-        cum_canvas[:,:,:3].astype(np.uint8).tobytes(),
-        canvas_shape[1],
-        canvas_shape[0],
-        3,
-        "uchar"
-    )
+    print("building slide")
+    if stride is None:
+        vips_img = vips.Image.new_from_memory(
+            cum_canvas[:,:,:3].astype(np.uint8).tobytes(),
+            canvas_shape[1],
+            canvas_shape[0],
+            3,
+            "uchar"
+        )
+    else:
+        vips_img = None
+        for tile, pos_x, pos_y in tqdm(process_in_tiles()):
+            temp_vips_image = vips.Image.new_from_memory(
+                tile.tobytes(), tile.shape[1], tile.shape[0], 3, "uchar"
+            )
+            
+            if vips_img is None:
+                vips_img = temp_vips_image
+            else:
+                vips_img = vips_img.insert(temp_vips_image, pos_y, pos_x, expand=True)
+
 
     # bioformats compatibility stuff
     image_height = vips_img.height
@@ -232,7 +291,7 @@ def construct_slide(slide_path, mask, patch_size=256, model=None, model_resoluti
     </OME>""")
 
     # set resolution metadata - tiffsave expects res in pixels per mm regardless of resunit
-    save_path = save_path / (filename.stem + '_proc.tiff')
+    save_path = save_path / (filename.stem + f'{save_suffix}.tiff')
     if save_resolution == 0:
         save_resolution = mpp
     else:
@@ -267,7 +326,8 @@ if __name__ == '__main__':
 
     transform_list = []
     transform_list += [ToFloatTensor()]
-    transform_list += [transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))]
+    if opt.model != 'stain_cycle':
+        transform_list += [transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))]
     trans = transforms.Compose(transform_list)
 
     # initialize logger
@@ -284,28 +344,33 @@ if __name__ == '__main__':
         def forward(self, tiles):
             if self.model is None:
                 return tiles.numpy()
+            undo_norm=True
+            if opt.model == 'stain_cycle':
+                undo_norm=False
             tiles = trans(tiles)
             if opt.direction == 'AtoB':
                 model.real_A = tiles.to(device)  # put image as input in mode A
                 if opt.model == 'pix2pix':
                     model.forward()          # run inference
                     img_B = model.fake_B
-                elif opt.model == 'cycle_gan':
+                elif opt.model in ['cycle_gan', 'stain_cycle']:
                     img_B = model.netG_A(model.real_A)  # only need fake B
-                return tensors2im(img_B)
+                return tensors2im(img_B, undo_norm=undo_norm)
                 
             elif opt.direction == 'BtoA':
                 model.real_B = tiles.to(device)
                 if opt.model == 'pix2pix':
                     model.forward()
                     img_A = model.fake_A
-                elif opt.model == 'cycle_gan':
+                elif opt.model in ['cycle_gan', 'stain_cycle']:
                     img_A = model.netG_B(model.real_B)
-                return tensors2im(img_A)
+                return tensors2im(img_A, undo_norm=undo_norm)
 
-    loader_workers = 0
+    loader_workers = 4
     slide_path = Path(opt.dataroot) 
-    save_path = Path(opt.results_dir) 
+    save_path = Path(opt.results_dir)
+    names = opt.names
+    save_suffix = opt.save_suffix
     batch_size = opt.batch_size
     stride = opt.stride
     if stride == 0:
@@ -336,6 +401,11 @@ if __name__ == '__main__':
         slides = list(slide_path.glob(slide_filter))
     else:
         slides = [slide_path]
+    if names:
+        named_files = []
+        for name in names:
+            named_files.extend([f for f in slides if name in f.stem])
+        slides = named_files
     slides.sort()
 
     print(f"found {len(slides)} slides")

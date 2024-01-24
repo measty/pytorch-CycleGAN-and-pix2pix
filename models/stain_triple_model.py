@@ -1,11 +1,13 @@
 import torch
 import itertools
+import numpy as np
 from util.image_pool import ImagePool
 from .base_model import BaseModel
 from . import networks
 
 
-class CycleGANModel(BaseModel):
+
+class StainTripleModel(BaseModel):
     """
     This class implements the CycleGAN model, for learning image-to-image translation without paired data.
 
@@ -70,10 +72,34 @@ class CycleGANModel(BaseModel):
         # define networks (both Generators and discriminators)
         # The naming is different from those used in the paper.
         # Code (vs. paper): G_A (G), G_B (F), D_A (D_Y), D_B (D_X)
-        self.netG_A = networks.define_G(opt.input_nc, opt.output_nc, opt.ngf, opt.netG, opt.norm,
-                                        not opt.no_dropout, opt.init_type, opt.init_gain, self.gpu_ids, opt.stain_task)
-        self.netG_B = networks.define_G(opt.output_nc, opt.input_nc, opt.ngf, opt.netG, opt.norm,
-                                        not opt.no_dropout, opt.init_type, opt.init_gain, self.gpu_ids, opt.stain_task)
+        if opt.stain_task is not None:
+            # default stain matrix
+            #stain_matrix = [[0.458,0.814,0.356],[0.259,0.866,0.428],[0.269,0.568,0.778]]
+            stain_matrix = torch.tensor([[0.65, 0.70, 0.29],
+                        [0.07, 0.99, 0.11],
+                        [0.27, 0.57, 0.78]])
+            orig_stain_mat = torch.tensor(stain_matrix)
+            stain_matrix = torch.nn.Parameter(torch.empty_like(orig_stain_mat).copy_(orig_stain_mat))
+        if opt.stain_task == "all":
+            # we have three stain modalities to transfer between, so to cover all combinations we need 6 networks
+            # these are: he->hd, he->hed, hd->he, hd->hed, hed->he, hed->hd
+            self.netG_HED_HE = networks.define_G(opt.input_nc, opt.output_nc, opt.ngf, opt.netG, opt.norm,
+                                            not opt.no_dropout, opt.init_type, opt.init_gain, self.gpu_ids, "he", stain_matrix)
+            self.netG_HED_HD = networks.define_G(opt.output_nc, opt.input_nc, opt.ngf, opt.netG, opt.norm,
+                                            not opt.no_dropout, opt.init_type, opt.init_gain, self.gpu_ids, "hd", stain_matrix)
+            self.netG_HD_HED = networks.define_G(opt.input_nc, opt.output_nc, opt.ngf, opt.netG, opt.norm,
+                                            not opt.no_dropout, opt.init_type, opt.init_gain, self.gpu_ids, "hed", stain_matrix)
+            self.netG_HD_HE = networks.define_G(opt.output_nc, opt.input_nc, opt.ngf, opt.netG, opt.norm,
+                                            not opt.no_dropout, opt.init_type, opt.init_gain, self.gpu_ids, "he", stain_matrix)
+            self.netG_HE_HD = networks.define_G(opt.input_nc, opt.output_nc, opt.ngf, opt.netG, opt.norm,
+                                            not opt.no_dropout, opt.init_type, opt.init_gain, self.gpu_ids, "hd", stain_matrix)
+            self.netG_HE_HED = networks.define_G(opt.output_nc, opt.input_nc, opt.ngf, opt.netG, opt.norm,
+                                            not opt.no_dropout, opt.init_type, opt.init_gain, self.gpu_ids, "hed", stain_matrix)                                           
+        else:
+            self.netG_A = networks.define_G(opt.input_nc, opt.output_nc, opt.ngf, opt.netG, opt.norm,
+                                            not opt.no_dropout, opt.init_type, opt.init_gain, self.gpu_ids, opt.stain_task.split("_")[1], stain_matrix)
+            self.netG_B = networks.define_G(opt.output_nc, opt.input_nc, opt.ngf, opt.netG, opt.norm,
+                                            not opt.no_dropout, opt.init_type, opt.init_gain, self.gpu_ids, opt.stain_task.split("_")[0], stain_matrix)
 
         if self.isTrain:  # define discriminators
             self.netD_A = networks.define_D(opt.output_nc, opt.ndf, opt.netD,
@@ -96,6 +122,28 @@ class CycleGANModel(BaseModel):
             self.optimizers.append(self.optimizer_G)
             self.optimizers.append(self.optimizer_D)
 
+    def generate_loop(self, start_domain, direction=None):
+        """generate a loop of stain domain translations.
+        
+        Given the stain domains {HE, HD, HED}, we want to generate a loop of translations
+        starting and ending in the specified domain, and passing through one of the other
+        domains, or the full loop, chosen randomly. returns a list of strings specifying the loop.
+        """
+        clockwise_order = {"HE": ["HD", "HED"], "HD": ["HED", "HE"], "HED": ["HE", "HD"]}
+        counter_clockwise_order = {"HE": ["HED", "HD"], "HD": ["HE", "HED"], "HED": ["HD", "HE"]}
+        if direction is None:
+            direction = np.random.choice(["clockwise", "counter_clockwise"])
+        if direction == "clockwise":
+            loop = [start_domain] + clockwise_order[start_domain]
+        else:
+            loop = [start_domain] + counter_clockwise_order[start_domain]
+        # 50-50 chance of doing the full loop or just pairwise
+        if np.random.choice([True, False]):
+            loop = loop + [start_domain]
+        else:
+            loop[-1] = start_domain
+        return loop
+    
     def set_input(self, input):
         """Unpack input data from the dataloader and perform necessary pre-processing steps.
 
