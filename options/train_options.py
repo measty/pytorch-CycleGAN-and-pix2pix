@@ -16,11 +16,11 @@ class TrainOptions(BaseOptions):
         parser.add_argument('--display_server', type=str, default="http://localhost", help='visdom server of the web display')
         parser.add_argument('--display_env', type=str, default='main', help='visdom display environment name (default is "main")')
         parser.add_argument('--display_port', type=int, default=8097, help='visdom port of the web display')
-        parser.add_argument('--update_html_freq', type=int, default=1000, help='frequency of saving training results to html')
+        parser.add_argument('--update_html_freq', type=int, default=400, help='frequency of saving training results to html')
         parser.add_argument('--print_freq', type=int, default=100, help='frequency of showing training results on console')
         parser.add_argument('--no_html', action='store_true', help='do not save intermediate training results to [opt.checkpoints_dir]/[opt.name]/web/')
         # network saving and loading parameters
-        parser.add_argument('--save_latest_freq', type=int, default=10000, help='frequency of saving the latest results')
+        parser.add_argument('--save_latest_freq', type=int, default=5000, help='frequency of saving the latest results')
         parser.add_argument('--save_epoch_freq', type=int, default=10, help='frequency of saving checkpoints at the end of epochs')
         parser.add_argument('--save_by_iter', action='store_true', help='whether saves model by iteration')
         parser.add_argument('--continue_train', action='store_true', help='continue training: load the latest model')
@@ -35,6 +35,14 @@ class TrainOptions(BaseOptions):
         parser.add_argument('--pool_size', type=int, default=50, help='the size of image buffer that stores previously generated images')
         parser.add_argument('--lr_policy', type=str, default='linear', help='learning rate policy. [linear | step | plateau | cosine]')
         parser.add_argument('--lr_decay_iters', type=int, default=50, help='multiply by a gamma every lr_decay_iters iterations')
+        # added parameters
+        parser.add_argument('--overlap', type=int, default=0, help='if > 0, extracts 4 overlapping patches per image and enforces an overlap consistency loss')
+        parser.add_argument('--l1_downsample', type=int, default=1, help='if > 1, downsamples the images by this factor before computing the L1 loss')
+        parser.add_argument('--dual_D', type=str, default='none', help='dual_only | all | none, if specified, uses a discriminator that is passed a real-fake pair, one from each domain. If all, use this also in tandem with the regular discriminators.')
+        parser.add_argument('--stain_loss', action='store_true', help='if specified, caculates l1 loss on stain channels, and uses soft threshold loss for cd8.')
+        parser.add_argument('--feat_loss', type=float, default=0.0, help='if specified, uses feature loss on the discriminator.')
+        parser.add_argument('--in_rgb', action='store_true', help='if specified, uses rgb input for the generator.')
+        parser.add_argument('--loss_domain', type=str, default='rgb', help='rgb | stain, specifies the domain to use for loss calculations.')
 
         self.isTrain = True
         return parser

@@ -112,7 +112,7 @@ def get_transform(opt, params=None, grayscale=False, method=transforms.Interpola
             if grayscale:
                 transform_list += [transforms.Normalize((0.5,), (0.5,))]
             else:
-                transform_list += [transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))]
+                transform_list += [transforms.Normalize(tuple([0.5] * opt.input_nc), tuple([0.5] * opt.input_nc))]
     return transforms.Compose(transform_list)
 
 

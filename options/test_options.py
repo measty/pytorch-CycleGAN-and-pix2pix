@@ -43,8 +43,9 @@ class SlideInferOptions(BaseOptions):
         parser.add_argument('--save_resolution', type=float, default=0, help='resolution to construct slide at in mpp. default 0 uses baseline.')
         parser.add_argument('--stride', type=int, default=0, help='stride to use for slide inference in pixels. default 0 uses patch size.')
         parser.add_argument('--bkgrnd_heuristic', type=str, default='none', help='heuristic to use for background removal. none or morph.')
-        parser.add_argument('--names', type=str, nargs='+', help='list of slide names to run inference on.')
+        parser.add_argument('--names', type=str, nargs='+', help='list of slide stems to run inference on.')
         parser.add_argument('--save_suffix', type=str, default='_proc', help='suffix to append to saved slide stem.')
+        parser.add_argument('--valid_check', action='store_true', help='check if patches are valid before inference. Useful if getting tissue mask is hard.')
         # rewrite devalue values
         parser.set_defaults(model='test')
         # To avoid cropping, the load_size should be the same as crop_size

@@ -106,6 +106,10 @@ class StainTripleModel(BaseModel):
                                             opt.n_layers_D, opt.norm, opt.init_type, opt.init_gain, self.gpu_ids)
             self.netD_B = networks.define_D(opt.input_nc, opt.ndf, opt.netD,
                                             opt.n_layers_D, opt.norm, opt.init_type, opt.init_gain, self.gpu_ids)
+            if opt.stain_task == "all":
+                # need extra discriminator for the third stain modality
+                self.netD_C = networks.define_D(opt.input_nc, opt.ndf, opt.netD,
+                                            opt.n_layers_D, opt.norm, opt.init_type, opt.init_gain, self.gpu_ids)
 
         if self.isTrain:
             if opt.lambda_identity > 0.0:  # only works when input and output images have the same number of channels
@@ -195,6 +199,11 @@ class StainTripleModel(BaseModel):
         """Calculate GAN loss for discriminator D_B"""
         fake_A = self.fake_A_pool.query(self.fake_A)
         self.loss_D_B = self.backward_D_basic(self.netD_B, self.real_A, fake_A)
+
+    def backward_D_C(self):
+        """Calculate GAN loss for discriminator D_C"""
+        fake_C = self.fake_C_pool.query(self.fake_C)
+        self.loss_D_C = self.backward_D_basic(self.netD_C, self.real_A, fake_C)
 
     def backward_G(self):
         """Calculate the loss for generators G_A and G_B"""

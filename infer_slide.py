@@ -91,7 +91,7 @@ def is_valid_patch(image):
     
     return True
 
-def construct_slide(slide_path, mask, patch_size=256, model=None, model_resolution=0, save_resolution=0, units='level', stride=None, save_path=None, back_heuristic='none', var_thresh=None, **kwargs):
+def construct_slide(slide_path, mask, patch_size=256, model=None, model_resolution=0, save_resolution=0, units='level', stride=None, save_path=None, back_heuristic='none', var_thresh=None, opt=None, **kwargs):
     
     
     filename = Path(slide_path)
@@ -149,6 +149,7 @@ def construct_slide(slide_path, mask, patch_size=256, model=None, model_resoluti
 
     #locs = patch_extractor.coordinate_list[:, :2]
 
+    print(f"creating memmap shape {tuple(canvas_shape) + (out_ch,)}")
     cum_canvas = np.lib.format.open_memmap(
         tmp_path,
         mode="w+",
@@ -169,7 +170,7 @@ def construct_slide(slide_path, mask, patch_size=256, model=None, model_resoluti
         to_proc = np.ones(ims.shape[0], dtype=bool)
         for i, tile in enumerate(ims):
             #import pdb; pdb.set_trace()
-            if (var_thresh and tile.var() < var_thresh) or not is_valid_patch(tile.numpy()):
+            if (var_thresh and tile.var() < var_thresh) or (opt.valid_check and not is_valid_patch(tile.numpy())):
                 to_proc[i] = False
         to_keep = []
         if to_proc.any():
@@ -190,7 +191,7 @@ def construct_slide(slide_path, mask, patch_size=256, model=None, model_resoluti
                 current_ind += 1
             else:
                 rec = back_tile
-            if model_resolution > 0 or save_resolution > 0 and units == 'mpp':
+            if model_resolution > 0 or save_resolution > 0 and units == 'mpp' and save_resolution != model_resolution:
                 x, y = int(x * model_resolution / save_resolution), int(y * model_resolution / save_resolution)
                 out_size = (np.array(rec.shape[:2]) * model_resolution / save_resolution).astype(int) + 1
                 rec = imresize(rec, output_size=out_size)
@@ -208,31 +209,22 @@ def construct_slide(slide_path, mask, patch_size=256, model=None, model_resoluti
                 # add the new tile to the canvas
                 cum_canvas[y:y + rec.shape[0], x:x + rec.shape[1], :3] += rec
     if stride is not None:
-        # set pixels that havent been written to background level
-        cum_canvas[cum_canvas[:,:,3] == 0, :3] = back_level
-        # set pixel counts of background pixels to 1 to avoid divide by zero
-        cum_canvas[cum_canvas[:,:,3] == 0, 3] = 1
         
         def process_in_tiles():
             # divide by the number of times each pixel was written to, patchwise to avoid memory issues
             for i in tqdm(range(0, cum_canvas.shape[0], 4096)):
                 for j in range(0, cum_canvas.shape[1], 4096):
-                    # cum_canvas[
-                    #     i : min(i + 4096, cum_canvas.shape[0]),
-                    #     j : min(j + 4096, cum_canvas.shape[1]),
-                    #     :3,
-                    # ] = 
+                    tile = np.array(cum_canvas[
+                            i : min(i + 4096, cum_canvas.shape[0]),
+                            j : min(j + 4096, cum_canvas.shape[1]),
+                            :,
+                        ])
+                    # set pixels that havent been written to background level
+                    tile[tile[:,:,3] == 0, :3] = back_level
+                    # set pixel counts of background pixels to 1 to avoid divide by zero
+                    tile[tile[:,:,3] == 0, 3] = 1
                     yield (
-                        cum_canvas[
-                            i : min(i + 4096, cum_canvas.shape[0]),
-                            j : min(j + 4096, cum_canvas.shape[1]),
-                            :3,
-                        ]
-                        / cum_canvas[
-                            i : min(i + 4096, cum_canvas.shape[0]),
-                            j : min(j + 4096, cum_canvas.shape[1]),
-                            3:4,
-                        ]
+                        tile[:,:,:3] / tile[:,:,3:4]
                     ).astype(
                         np.uint8
                     ), i, j
@@ -296,7 +288,7 @@ def construct_slide(slide_path, mask, patch_size=256, model=None, model_resoluti
         save_resolution = mpp
     else:
         save_resolution = np.array([save_resolution, save_resolution])
-    vips_img.tiffsave(save_path, tile=True, pyramid=True, compression="jpeg", Q=85, bigtiff=True, xres=1000/save_resolution[0], yres=1000/save_resolution[1], resunit="cm", tile_width=512, tile_height=512) #, subifd=True)
+    vips_img.tiffsave(save_path, tile=True, pyramid=True, compression="jpeg", Q=88, bigtiff=True, xres=1000/save_resolution[0], yres=1000/save_resolution[1], resunit="cm", tile_width=512, tile_height=512) #, subifd=True)
     print(f"saved slide {filename.stem} to {save_path}")
     # close memmap and clean up
     cum_canvas._mmap.close()
@@ -354,7 +346,7 @@ if __name__ == '__main__':
                     model.forward()          # run inference
                     img_B = model.fake_B
                 elif opt.model in ['cycle_gan', 'stain_cycle']:
-                    img_B = model.netG_A(model.real_A)  # only need fake B
+                    img_B = model.netComb_A(model.netG_A(model.netSep_A(model.real_A)))  # only need fake B
                 return tensors2im(img_B, undo_norm=undo_norm)
                 
             elif opt.direction == 'BtoA':
@@ -417,6 +409,6 @@ if __name__ == '__main__':
         else:
             mask = mask_opt
         print(f"starting slide {slide}")
-        construct_slide(slide, mask, model=ModelWrapper(model), model_resolution=model_resolution, save_resolution=save_resolution, units=units, stride=stride, save_path=save_path, back_heuristic=back_heuristic, var_thresh=var_thresh)
+        construct_slide(slide, mask, model=ModelWrapper(model), model_resolution=model_resolution, save_resolution=save_resolution, units=units, stride=stride, save_path=save_path, back_heuristic=back_heuristic, var_thresh=var_thresh, opt=opt)
         
 

@@ -138,8 +138,8 @@ class RGB2OD(nn.Module):
         super(RGB2OD, self).__init__()
 
     def forward(self, x):
-        x = torch.clamp(x, 1E-6)
-        log_adjust = torch.log(torch.tensor(1E-6))
+        x = torch.clamp(x, 1E-4)
+        log_adjust = torch.log(torch.tensor(1E-4))
         return torch.log(x) / log_adjust
 
 class OD2RGB(nn.Module):
@@ -147,7 +147,7 @@ class OD2RGB(nn.Module):
         super(OD2RGB, self).__init__()
 
     def forward(self, x):
-        x = torch.clamp(x, 1e-6)
+        x = torch.clamp(x, 1e-4)
         return torch.exp(-1 * x)
 
 class StainSeparate(nn.Module):
@@ -156,7 +156,7 @@ class StainSeparate(nn.Module):
         self.stain_matrix = stain_matrix
 
     def forward(self, x):
-        x = torch.einsum("ijkl,jm->imkl", x, torch.inverse(self.stain_matrix))
+        x = torch.einsum("ijkl,jm->imkl", x, torch.pinverse(self.stain_matrix))
         return x
 
 class StainCombine(nn.Module):
@@ -165,7 +165,7 @@ class StainCombine(nn.Module):
         self.stain_matrix = stain_matrix
 
     def forward(self, x):
-        log_adjust = -torch.log(torch.tensor(1E-6))
+        log_adjust = -torch.log(torch.tensor(1E-4))
         # multiply with inverse of stain matrix
         x = torch.einsum("ijkl,jm->imkl", x * log_adjust, self.stain_matrix)
         return x
@@ -289,7 +289,7 @@ def init_net(net, init_type='normal', init_gain=0.02, gpu_ids=[]):
     return net
 
 
-def define_G(input_nc, output_nc, ngf, netG, norm='batch', use_dropout=False, init_type='normal', init_gain=0.02, gpu_ids=[], stain_task: str = None, stain_matrix=None, lum_pass=False):
+def define_G(input_nc, output_nc, ngf, netG, norm='batch', use_dropout=False, init_type='normal', init_gain=0.02, gpu_ids=[], stain_task: str = None, lum_pass=False):
     """Create a generator
 
     Parameters:
@@ -336,17 +336,17 @@ def define_G(input_nc, output_nc, ngf, netG, norm='batch', use_dropout=False, in
         # check which channel to zero out
         stain_task = {"HE": 2, "HD": 1, "HED": None}[stain_task.upper()]
         net = nn.Sequential(
-            RGB2OD(),
-            StainSeparate(stain_matrix),
-            nn.ReLU(),
-            transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
+            #RGB2OD(),
+            #StainSeparate(stain_matrix[0]),
+            ##nn.ReLU(),
+            transforms.Normalize(tuple([0.5] * input_nc), tuple([0.5] * input_nc)),
             net,
             UndoNormalize(),
         #), "stain_applier": nn.Sequential(
-            ZeroStain(stain_task),
-            StainCombine(stain_matrix),
-            OD2RGB(),
-            nn.ReLU(),
+            #ZeroStain(stain_task),
+            #StainCombine(stain_matrix[1]),
+            #OD2RGB(),
+            #nn.ReLU(),
         )
         if lum_pass:
             net = LumMask(net)
@@ -355,6 +355,34 @@ def define_G(input_nc, output_nc, ngf, netG, norm='batch', use_dropout=False, in
     
     return init_net(net, init_type, init_gain, gpu_ids)
 
+def define_stain_sep(stain_matrix, gpu_ids=[]):
+    """Create a stain separation block."""
+    net = nn.Sequential(
+            RGB2OD(),
+            StainSeparate(stain_matrix),
+            #nn.ReLU(),
+        )
+    if len(gpu_ids) > 0:
+        assert(torch.cuda.is_available())
+        net.to(gpu_ids[0])
+        net = torch.nn.DataParallel(net, gpu_ids)  # multi-GPUs
+    return net
+
+def define_stain_comb(stain_matrix, stain_task, gpu_ids=[]):
+    """Create a stain combination block."""
+    # check which channel to zero out
+    stain_task = {"HE": 2, "HD": 1, "HED": None}[stain_task.upper()]
+    net = nn.Sequential(
+            ZeroStain(stain_task),
+            StainCombine(stain_matrix),
+            OD2RGB(),
+            nn.ReLU(),
+        )
+    if len(gpu_ids) > 0:
+        assert(torch.cuda.is_available())
+        net.to(gpu_ids[0])
+        net = torch.nn.DataParallel(net, gpu_ids)  # multi-GPUs
+    return net
 
 def define_D(input_nc, ndf, netD, n_layers_D=3, norm='batch', init_type='normal', init_gain=0.02, gpu_ids=[]):
     """Create a discriminator
@@ -778,6 +806,14 @@ class NLayerDiscriminator(nn.Module):
     def forward(self, input):
         """Standard forward."""
         return self.model(input)
+    
+    def forward_first_n(self, input, n=3):
+        """Forward for the first n layers then average pool."""
+        for layer in self.model[:n]:
+            input = layer(input)
+        # average pool using adaptive pooling
+        input = nn.AdaptiveAvgPool2d(1)(input)
+        return input
 
 
 class PixelDiscriminator(nn.Module):
